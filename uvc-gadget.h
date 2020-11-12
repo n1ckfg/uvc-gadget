@@ -94,12 +94,6 @@ struct uvc_event
 #define REQEC_INVALID_REQUEST 0x07
 #define REQEC_INVALID_VALUE 0x08
 
-/* IO methods supported */
-enum io_method {
-    IO_METHOD_MMAP,
-    IO_METHOD_USERPTR,
-};
-
 enum video_stream_action {
     STREAM_OFF,
     STREAM_ON,
@@ -172,6 +166,8 @@ unsigned int streaming_maxburst = 0;
 unsigned int streaming_maxpacket = 1023;
 unsigned int streaming_interval = 1;
 
+bool shutdown_request = false;
+
 /* ---------------------------------------------------------------------------
  * V4L2 and UVC device instances
  */
@@ -192,7 +188,6 @@ struct v4l2_device {
     int is_streaming;
 
     /* v4l2 buffer specific */
-    enum io_method io;
     struct buffer *mem;
     unsigned int nbufs;
     unsigned int buffer_type;
@@ -211,9 +206,6 @@ struct v4l2_device {
     unsigned int control_interface;
     unsigned int control_type;
 
-    /* uvc specific flags */
-    int uvc_shutdown_requested;
-
     /* v4l2 device hook */
     struct v4l2_device *vdev;
     
@@ -227,7 +219,6 @@ struct v4l2_device {
 struct uvc_settings {
     char * uvc_devname;
     char * v4l2_devname;
-    enum io_method uvc_io_method;
     unsigned int nbufs;
     bool show_fps;
     bool streaming_status_onboard;
@@ -239,7 +230,6 @@ struct uvc_settings {
 struct uvc_settings settings = {
     .uvc_devname = "/dev/video0",
     .v4l2_devname = "/dev/video1",
-    .uvc_io_method = IO_METHOD_USERPTR,
     .nbufs = 2,
     .show_fps = false,
     .streaming_status_onboard = false,

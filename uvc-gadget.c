@@ -331,8 +331,8 @@ static void v4l2_uninit_device(struct v4l2_device *dev)
 {
     unsigned int i;
 
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
+    switch (dev->memory_type) {
+    case V4L2_MEMORY_MMAP:
         for (i = 0; i < dev->nbufs; ++i) {
             if (munmap(dev->mem[i].start, dev->mem[i].length) < 0) {
                 printf("%s: munmap failed\n", dev->device_type_name);
@@ -342,7 +342,7 @@ static void v4l2_uninit_device(struct v4l2_device *dev)
         free(dev->mem);
         break;
 
-    case IO_METHOD_USERPTR:
+    case V4L2_MEMORY_USERPTR:
     default:
         break;
     }
@@ -362,7 +362,7 @@ static int v4l2_video_stream(struct v4l2_device * dev, enum video_stream_action 
 
         printf("%s: STREAM ON success\n", dev->device_type_name);
         dev->is_streaming = 1;
-        dev->uvc_shutdown_requested = 0;
+        shutdown_request = false;
 
     } else if (dev->is_streaming) {
         ret = ioctl(dev->fd, VIDIOC_STREAMOFF, &type);
@@ -507,12 +507,12 @@ static int v4l2_reqbufs(struct v4l2_device *dev, int nbufs)
     dev->dqbuf_count = 0;
     dev->qbuf_count = 0;
 
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
+    switch (dev->buffer_type) {
+    case V4L2_MEMORY_MMAP:
         ret = v4l2_reqbufs_mmap(dev, nbufs);
         break;
 
-    case IO_METHOD_USERPTR:
+    case V4L2_MEMORY_USERPTR:
         ret = v4l2_reqbufs_userptr(dev, nbufs);
         break;
 
@@ -548,84 +548,79 @@ static int v4l2_qbuf_mmap(struct v4l2_device * dev)
     return 0;
 }
 
-static int v4l2_qbuf(struct v4l2_device *dev)
+static void v4l2_process_buffers(struct v4l2_device * sdev)
 {
-    int ret = 0;
+    struct v4l2_device * tdev;
+    struct v4l2_buffer sbuf;
+    struct v4l2_buffer tbuf;
 
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        ret = v4l2_qbuf_mmap(dev);
-        break;
-
-    case IO_METHOD_USERPTR:
-        /* Empty. */
-        ret = 0;
-        break;
-
-    default:
-        ret = -EINVAL;
-        break;
+    if (sdev->device_type == DEVICE_TYPE_V4L2) {
+        if (sdev->udev->is_streaming && sdev->dqbuf_count >= sdev->qbuf_count ) {
+            return;
+        }
+        tdev = sdev->udev;
     }
 
-    return ret;
-}
+    if (sdev->device_type == DEVICE_TYPE_UVC) {
+        if (!shutdown_request && ((sdev->dqbuf_count + 1) >= sdev->qbuf_count)) {
+            return;
+        }
+        tdev = sdev->vdev;
+    }
 
-static void v4l2_process_data(struct v4l2_device *dev)
-{
-    struct v4l2_buffer vbuf;
-    struct v4l2_buffer ubuf;
+    /* Dequeue spent buffer */
+    CLEAR(sbuf);
+    sbuf.type = sdev->buffer_type;
+    sbuf.memory = sdev->memory_type;
 
-    if (dev->udev->is_streaming && dev->dqbuf_count >= dev->qbuf_count) {
+    if (ioctl(sdev->fd, VIDIOC_DQBUF, &sbuf) < 0) {
+        printf("%s: Unable to dequeue buffer: %s (%d).\n",
+            sdev->device_type_name, strerror(errno), errno);
         return;
     }
 
-    /* Dequeue spent buffer from V4L2 domain. */
-    CLEAR(vbuf);
-    vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    vbuf.memory = dev->memory_type;
-
-    if (ioctl(dev->fd, VIDIOC_DQBUF, &vbuf) < 0) {
+    if (sbuf.flags & V4L2_BUF_FLAG_ERROR) {
+        shutdown_request = true;
+        printf("%s: Buffer error.\n", sdev->device_type_name);
         return;
     }
 
-    dev->dqbuf_count++;
+    sdev->dqbuf_count++;
 
-    /* Queue video buffer to UVC domain. */
-    CLEAR(ubuf);
+    /* Queue video buffer */
+    CLEAR(tbuf);
+    tbuf.type = tdev->buffer_type;
+    tbuf.memory = tdev->memory_type;
+    tbuf.index = sbuf.index;
 
-    ubuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    switch (dev->udev->io) {
-    case IO_METHOD_MMAP:
-        ubuf.memory = V4L2_MEMORY_MMAP;
-        ubuf.length = vbuf.length;
-        ubuf.index = vbuf.index;
-        ubuf.bytesused = vbuf.bytesused;
-        break;
-
-    case IO_METHOD_USERPTR:
-    default:
-        ubuf.memory = V4L2_MEMORY_USERPTR;
-        ubuf.m.userptr = (unsigned long)dev->mem[vbuf.index].start;
-        ubuf.length = dev->mem[vbuf.index].length;
-        ubuf.index = vbuf.index;
-        ubuf.bytesused = vbuf.bytesused;
-        break;
+    if (tdev->memory_type == V4L2_MEMORY_USERPTR) {
+        tbuf.m.userptr = (unsigned long) sdev->mem[sbuf.index].start;
+        tbuf.length = sdev->mem[sbuf.index].length;
+        tbuf.bytesused = sbuf.bytesused;
     }
 
-    if (ioctl(dev->udev->fd, VIDIOC_QBUF, &ubuf) < 0) {
+    if (ioctl(tdev->fd, VIDIOC_QBUF, &tbuf) < 0) {
+        printf("%s: Unable to queue buffer: %s (%d).\n",
+            tdev->device_type_name, strerror(errno), errno);
+
         /* Check for a USB disconnect/shutdown event. */
         if (errno == ENODEV) {
-            dev->udev->uvc_shutdown_requested = 1;
-            printf("UVC: Possible USB shutdown requested from Host, seen during VIDIOC_QBUF\n");
+            shutdown_request = true;
+            printf("%s: Possible USB shutdown requested from Host, seen during VIDIOC_QBUF\n",
+                tdev->device_type_name);
         }
         return;
     }
 
-    dev->udev->qbuf_count++;
+    tdev->qbuf_count++;
 
-    if (!dev->udev->is_streaming) {
-        v4l2_video_stream(dev->udev, STREAM_ON);
-        streaming_status_value((dev->udev->is_streaming) ? STREAM_ON : STREAM_OFF);
+    if (settings.show_fps && tdev->device_type == DEVICE_TYPE_UVC) {
+        tdev->buffers_processed++;
+    }
+
+    if (!tdev->is_streaming) {
+        v4l2_video_stream(tdev, STREAM_ON);
+        streaming_status_value((tdev->is_streaming) ? STREAM_ON : STREAM_OFF);
     }
 }
 
@@ -872,62 +867,6 @@ static void v4l2_get_available_formats(struct v4l2_device *dev)
  * UVC streaming related
  */
 
-static void uvc_video_process(struct v4l2_device *dev)
-{
-    struct v4l2_buffer ubuf;
-    struct v4l2_buffer vbuf;
-    /*
-     * Do not dequeue buffers from UVC side until there are atleast
-     * 2 buffers available at UVC domain.
-     */
-    if (!dev->uvc_shutdown_requested && ((dev->dqbuf_count + 1) >= dev->qbuf_count)) {
-        return;
-    }
-
-    /* Prepare a v4l2 buffer to be dequeued from UVC domain. */
-    CLEAR(ubuf);
-    ubuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    ubuf.memory = dev->memory_type;
-
-    /* Dequeue the spent buffer from UVC domain */
-    if (ioctl(dev->fd, VIDIOC_DQBUF, &ubuf) < 0) {
-        printf("UVC: Unable to dequeue buffer: %s (%d).\n", strerror(errno), errno);
-        return;
-    }
-
-    dev->dqbuf_count++;
-
-    /*
-        * If the dequeued buffer was marked with state ERROR by the
-        * underlying UVC driver gadget, do not queue the same to V4l2
-        * and wait for a STREAMOFF event on UVC side corresponding to
-        * set_alt(0). So, now all buffers pending at UVC end will be
-        * dequeued one-by-one and we will enter a state where we once
-        * again wait for a set_alt(1) command from the USB host side.
-        */
-    if (ubuf.flags & V4L2_BUF_FLAG_ERROR) {
-        dev->uvc_shutdown_requested = 1;
-        printf("UVC: Possible USB shutdown requested from Host, seen during VIDIOC_DQBUF\n");
-        return;
-    }
-
-    /* Queue the buffer to V4L2 domain */
-    CLEAR(vbuf);
-    vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    vbuf.memory = V4L2_MEMORY_MMAP;
-    vbuf.index = ubuf.index;
-
-    if (ioctl(dev->vdev->fd, VIDIOC_QBUF, &vbuf) < 0) {
-        return;
-    }
-
-    dev->vdev->qbuf_count++;
-
-    if (settings.show_fps) {
-        dev->buffers_processed++;
-    }
-}
-
 static void uvc_handle_streamon_event(struct v4l2_device *dev)
 {
     if (v4l2_reqbufs(dev->vdev, dev->vdev->nbufs) < 0) {
@@ -938,18 +877,12 @@ static void uvc_handle_streamon_event(struct v4l2_device *dev)
         return;
     }
 
-    if (v4l2_qbuf(dev->vdev) < 0) {
+    if (v4l2_qbuf_mmap(dev->vdev) < 0) {
         return;
     }
 
     /* Start V4L2 capturing now. */
     if (v4l2_video_stream(dev->vdev, STREAM_ON) < 0) {
-        return;
-    }
-
-    /* Common setup. */
-    /* Queue buffers to UVC domain and start streaming. */
-    if (v4l2_qbuf(dev) < 0) {
         return;
     }
 }
@@ -1396,7 +1329,7 @@ static void uvc_events_process(struct v4l2_device *dev)
         break;
 
     case UVC_EVENT_DISCONNECT:
-        dev->uvc_shutdown_requested = 1;
+        shutdown_request = true;
         printf("UVC: Possible USB shutdown requested from Host, seen via UVC_EVENT_DISCONNECT\n");
         break;
 
@@ -1507,21 +1440,21 @@ static void processing_loop_video(struct v4l2_device * udev, struct v4l2_device 
         if (vdev->is_streaming) {
 
             if (FD_ISSET(udev->fd, &dfds)) {
-                uvc_video_process(udev);
-
-                if (settings.show_fps) {
-                    gettimeofday(&video_tv, 0);
-                    double now = (video_tv.tv_sec + (video_tv.tv_usec * 1e-6)) * 1000;
-                    if (now - udev->last_time_video_process >= 1000) {
-                        printf("FPS: %d\n", udev->buffers_processed);
-                        udev->buffers_processed = 0;
-                        udev->last_time_video_process = now;
-                    }
-                }
+                v4l2_process_buffers(udev);
             }
 
             if (FD_ISSET(vdev->fd, &fdsv)) {
-                v4l2_process_data(vdev);
+                v4l2_process_buffers(vdev);
+            }
+
+            if (settings.show_fps) {
+                gettimeofday(&video_tv, 0);
+                double now = (video_tv.tv_sec + (video_tv.tv_usec * 1e-6)) * 1000;
+                if (now - udev->last_time_video_process >= 1000) {
+                    printf("FPS: %d\n", udev->buffers_processed);
+                    udev->buffers_processed = 0;
+                    udev->last_time_video_process = now;
+                }
             }
         }
     }
@@ -1549,32 +1482,16 @@ int init()
     v4l2_get_available_formats(vdev);
     v4l2_get_controls(vdev);
 
+    /* UVC device settings */
+    udev->nbufs = settings.nbufs;
+    udev->memory_type = V4L2_MEMORY_USERPTR;
     udev->vdev = vdev;
+
+    /* V4L2 device settings */
+    vdev->nbufs = settings.nbufs;
+    vdev->memory_type = V4L2_MEMORY_MMAP;
     vdev->udev = udev;
 
-    /* Set parameters as passed by user. */
-    udev->io = settings.uvc_io_method;
-    udev->nbufs = settings.nbufs;
-
-    /* UVC - V4L2 integrated path */
-    vdev->nbufs = settings.nbufs;
-
-    /*
-     * IO methods used at UVC and V4L2 domains must be
-     * complementary to avoid any memcpy from the CPU.
-     */
-    if (udev->io == IO_METHOD_MMAP) {
-        vdev->io = IO_METHOD_USERPTR;
-        vdev->memory_type = V4L2_MEMORY_USERPTR;
-        udev->memory_type = V4L2_MEMORY_MMAP;
-
-    } else {
-        vdev->io = IO_METHOD_MMAP;
-        vdev->memory_type = V4L2_MEMORY_MMAP;
-        udev->memory_type = V4L2_MEMORY_USERPTR;
-
-    }  
-    
     /* Init UVC events. */
     uvc_events_init(udev);
 
@@ -1868,7 +1785,6 @@ static void show_settings()
 {
     printf("SETTINGS: Number of buffers requested: %d\n", settings.nbufs);
     printf("SETTINGS: Show FPS: %s\n", (settings.show_fps) ? "ENABLED" : "DISABLED");
-    printf("SETTINGS: IO method requested: %s\n", (settings.uvc_io_method == IO_METHOD_MMAP) ? "MMAP" : "USER_PTR");
     if (settings.streaming_status_pin) {
         printf("SETTINGS: GPIO pin for streaming status: %s\n", settings.streaming_status_pin);
     } else {
@@ -1908,14 +1824,6 @@ int main(int argc, char *argv[])
                 goto err;
             }
             settings.nbufs = atoi(optarg);
-            break;
-
-        case 'o':
-            if (atoi(optarg) < 0 || atoi(optarg) > 1) {
-                fprintf(stderr, "ERROR: UVC IO method value out of range\n");
-                goto err;
-            }
-            settings.uvc_io_method = (atoi(optarg) == 0) ? IO_METHOD_MMAP : IO_METHOD_USERPTR;
             break;
 
         case 'p':
